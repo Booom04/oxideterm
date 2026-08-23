@@ -17,17 +17,37 @@ use oxideterm_environment::{
     current_directory_shell_path_argument, list_local_current_directory,
     sort_current_directory_entries,
 };
-use oxideterm_sftp::{FileType as RemotePathFileType, ListFilter, SortOrder};
+use oxideterm_sftp::{FileType as RemotePathFileType, ListFilter, SftpError, SortOrder};
 use oxideterm_ssh::NodeId;
 
 use super::*;
 
-const TERMINAL_CWD_REMOTE_LIST_TIMEOUT: Duration = Duration::from_millis(1_200);
+const TERMINAL_CWD_REMOTE_LIST_TIMEOUT: Duration = Duration::from_secs(10);
 const TERMINAL_CWD_REPORT_POLL_INTERVAL: Duration = Duration::from_millis(40);
 const TERMINAL_CWD_REPORT_POLL_ATTEMPTS: usize = 30;
 const TERMINAL_CWD_MAX_ENTRIES: usize = 160;
 const TERMINAL_CWD_LIST_ESTIMATED_HEIGHT: f32 = 42.0;
 const TERMINAL_CWD_LIST_OVERSCAN: usize = 8;
+
+fn terminal_cwd_sftp_error_kind(error: &SftpError) -> &'static str {
+    match error {
+        SftpError::SubsystemNotAvailable(_) => "subsystem_not_available",
+        SftpError::PermissionDenied(_) => "permission_denied",
+        SftpError::FileNotFound(_) => "file_not_found",
+        SftpError::DirectoryNotFound(_) => "directory_not_found",
+        SftpError::IoError(_) => "io_error",
+        SftpError::ChannelError(_) => "channel_error",
+        SftpError::ProtocolError(_) => "protocol_error",
+        SftpError::InvalidPath(_) => "invalid_path",
+        SftpError::TransferCancelled => "transfer_cancelled",
+        SftpError::TransferInterrupted(_) => "transfer_interrupted",
+        SftpError::TransferShutdown => "transfer_shutdown",
+        SftpError::NotInitialized(_) => "not_initialized",
+        SftpError::TransferError(_) => "transfer_error",
+        SftpError::WriteError(_) => "write_error",
+        SftpError::StorageError(_) => "storage_error",
+    }
+}
 
 pub(in crate::workspace) fn terminal_cwd_list_spec() -> TauriVirtualListSpec {
     TauriVirtualListSpec::new(
@@ -499,25 +519,44 @@ impl WorkspaceTerminalEntity {
         let tx = self.cwd_tx.clone();
         let cwd = key.path().to_string();
         self.runtime.spawn(async move {
-            let outcome = tokio::time::timeout(TERMINAL_CWD_REMOTE_LIST_TIMEOUT, async {
+            let outcome = match tokio::time::timeout(TERMINAL_CWD_REMOTE_LIST_TIMEOUT, async {
                 // Acquire the registry-owned SFTP consumer; picker lifetime must
                 // never create or disconnect an unmanaged SSH transport.
-                let shared = node_router
-                    .acquire_sftp(&node_id)
-                    .await
-                    .map_err(|error| error.to_string())?;
+                let shared = match node_router.acquire_sftp(&node_id).await {
+                    Ok(shared) => shared,
+                    Err(_) => {
+                        tracing::warn!(
+                            generation,
+                            stage = "acquire_sftp",
+                            "remote current-directory listing failed"
+                        );
+                        return None;
+                    }
+                };
                 let entries = {
                     let sftp = shared.lock().await;
-                    sftp.list_dir_with_cwd(
-                        &cwd,
-                        Some(ListFilter {
-                            show_hidden: true,
-                            pattern: None,
-                            sort: SortOrder::Name,
-                        }),
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?
+                    match sftp
+                        .list_dir_with_cwd(
+                            &cwd,
+                            Some(ListFilter {
+                                show_hidden: true,
+                                pattern: None,
+                                sort: SortOrder::Name,
+                            }),
+                        )
+                        .await
+                    {
+                        Ok(entries) => entries,
+                        Err(error) => {
+                            tracing::warn!(
+                                generation,
+                                stage = "list_dir",
+                                error_kind = terminal_cwd_sftp_error_kind(&error),
+                                "remote current-directory listing failed"
+                            );
+                            return None;
+                        }
+                    }
                 };
                 let (_, entries) = entries;
                 let mut rows = entries
@@ -535,13 +574,21 @@ impl WorkspaceTerminalEntity {
                     .collect::<Vec<_>>();
                 sort_current_directory_entries(&mut rows);
                 rows.truncate(TERMINAL_CWD_MAX_ENTRIES);
-                Ok::<Vec<CurrentDirectoryEntry>, String>(rows)
+                Some(rows)
             })
             .await
-            .ok()
-            .and_then(|result| result.ok())
-            .map(TerminalCwdListOutcome::Ready)
-            .unwrap_or(TerminalCwdListOutcome::RemoteListFailed);
+            {
+                Ok(Some(rows)) => TerminalCwdListOutcome::Ready(rows),
+                Ok(None) => TerminalCwdListOutcome::RemoteListFailed,
+                Err(_) => {
+                    tracing::warn!(
+                        generation,
+                        timeout_ms = TERMINAL_CWD_REMOTE_LIST_TIMEOUT.as_millis() as u64,
+                        "remote current-directory listing timed out"
+                    );
+                    TerminalCwdListOutcome::RemoteListFailed
+                }
+            };
             let _ = tx.send(TerminalCwdDelivery::DirectoryList {
                 key,
                 generation,
@@ -1065,6 +1112,11 @@ fn terminal_cwd_entry_confirms_directory(kind: TerminalCwdVisibleEntryKind) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_directory_listing_allows_slow_sftp_round_trips() {
+        assert!(TERMINAL_CWD_REMOTE_LIST_TIMEOUT >= Duration::from_secs(10));
+    }
 
     #[test]
     fn only_resolved_rows_update_cwd_optimistically() {
