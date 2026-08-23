@@ -7,7 +7,7 @@ fn ssh_client_config(
         keepalive_interval: Some(Duration::from_secs(30)),
         keepalive_max: 3,
         window_size: 32 * 1024 * 1024,
-        maximum_packet_size: 256 * 1024,
+        maximum_packet_size: 32 * 1024,
         ..client::Config::default()
     };
     // The persisted policy is compiled once per physical connection. Invalid

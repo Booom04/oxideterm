@@ -22,7 +22,7 @@ use oxideterm_ssh::NodeId;
 
 use super::*;
 
-const TERMINAL_CWD_REMOTE_LIST_TIMEOUT: Duration = Duration::from_secs(10);
+const TERMINAL_CWD_REMOTE_LIST_TIMEOUT: Duration = Duration::from_secs(20);
 const TERMINAL_CWD_REPORT_POLL_INTERVAL: Duration = Duration::from_millis(40);
 const TERMINAL_CWD_REPORT_POLL_ATTEMPTS: usize = 30;
 const TERMINAL_CWD_MAX_ENTRIES: usize = 160;
